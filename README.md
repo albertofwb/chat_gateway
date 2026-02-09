@@ -26,6 +26,7 @@ uv run voice_listener.py --device 6 --session-id voice-albert-001
 
 `--device 6` is the `pulse` input device (usually the most stable choice).
 By default, replies are spoken locally via `~/.local/bin/tts` (Xiaoxiao voice).
+During TTS playback, press `Space` in the terminal to stop playback immediately.
 
 ### TTS options
 
@@ -35,6 +36,9 @@ uv run voice_listener.py --device 6 --no-tts
 
 # Use another TTS command path
 uv run voice_listener.py --device 6 --tts-command ~/.local/bin/xiaoxiao-tts
+
+# Increase anti-echo cooldown (if TTS still gets re-captured)
+uv run voice_listener.py --device 6 --post-tts-cooldown 2.0
 ```
 
 ### Fixed independent session

@@ -18,9 +18,16 @@ Usage:
 import argparse
 import json
 import os
+import re
+import select
+import signal
 import subprocess
+import sys
 import tempfile
+import termios
 import time
+import tty
+import unicodedata
 import uuid
 import wave
 from datetime import datetime
@@ -41,6 +48,7 @@ MIN_RECORDING_DURATION = 0.5
 
 # Whisper model
 MODEL_SIZE = "base"
+POST_TTS_COOLDOWN = 1.0
 
 # Lock file for TTS synchronization
 TTS_LOCK_FILE = "/tmp/tts-playing.lock"
@@ -165,6 +173,43 @@ def extract_reply(payload: dict) -> str | None:
     return None
 
 
+def extract_run_status(payload: dict) -> tuple[str | None, str | None, str | None]:
+    """Extract high-level run status fields for logging."""
+    if not isinstance(payload, dict):
+        return None, None, None
+    run_id = payload.get("runId")
+    status = payload.get("status")
+    summary = payload.get("summary")
+    return run_id, status, summary
+
+
+def sanitize_tts_text(text: str) -> str:
+    """Clean markdown/emojis/noise so TTS sounds natural."""
+    if not text:
+        return ""
+
+    cleaned = text
+    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__(.*?)__", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
+    cleaned = re.sub(r"~~(.*?)~~", r"\1", cleaned)
+    cleaned = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", cleaned)
+
+    allowed_punct = set(" ,.!?;:-()[]{}'\"，。！？；：、（）")
+    output = []
+    for char in cleaned:
+        if char.isspace() or char in allowed_punct:
+            output.append(char)
+            continue
+        category = unicodedata.category(char)
+        if category.startswith("L") or category.startswith("N"):
+            output.append(char)
+
+    cleaned = "".join(output)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 class XiaoxiaoTTS:
     def __init__(self, command_path: str = DEFAULT_TTS_COMMAND):
         self.command_path = os.path.expanduser(command_path)
@@ -172,28 +217,86 @@ class XiaoxiaoTTS:
     def is_available(self) -> bool:
         return os.path.isfile(self.command_path) and os.access(self.command_path, os.X_OK)
 
-    def playback(self, text: str) -> bool:
+    def playback(self, text: str, stop_checker=None) -> bool:
         if not text or not self.is_available():
             return False
 
+        process = None
         try:
             with open(TTS_LOCK_FILE, "w", encoding="utf-8") as lock_file:
                 lock_file.write(str(os.getpid()))
 
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [self.command_path, text],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                check=False,
+                preexec_fn=os.setsid,
             )
-            return result.returncode == 0
+
+            while True:
+                return_code = process.poll()
+                if return_code is not None:
+                    return return_code == 0
+
+                if stop_checker and stop_checker():
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=2)
+                    return False
+
+                time.sleep(0.05)
         except Exception:
+            if process and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except Exception:
+                    pass
             return False
         finally:
             try:
                 os.unlink(TTS_LOCK_FILE)
             except FileNotFoundError:
                 pass
+
+
+class KeyboardMonitor:
+    def __init__(self):
+        self.enabled = False
+        self.fd = None
+        self.old_settings = None
+
+    def start(self):
+        if not sys.stdin.isatty():
+            return
+        self.fd = sys.stdin.fileno()
+        self.old_settings = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        self.enabled = True
+
+    def stop(self):
+        if self.enabled and self.fd is not None and self.old_settings is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+        self.enabled = False
+
+    def consume_space_pressed(self) -> bool:
+        if not self.enabled:
+            return False
+        if self.fd is None:
+            return False
+        pressed = False
+        try:
+            while True:
+                ready, _, _ = select.select([sys.stdin], [], [], 0)
+                if not ready:
+                    break
+                ch = os.read(self.fd, 1).decode("utf-8", errors="ignore")
+                if ch == " ":
+                    pressed = True
+        except Exception:
+            return False
+        return pressed
 
 
 class VoiceListener:
@@ -211,6 +314,7 @@ class VoiceListener:
         gateway_token=None,
         tts_enabled=True,
         tts_command=DEFAULT_TTS_COMMAND,
+        post_tts_cooldown=POST_TTS_COOLDOWN,
     ):
         self.device_index = device_index
         self.running = False
@@ -223,6 +327,9 @@ class VoiceListener:
         self.gateway_token = gateway_token
         self.tts_enabled = tts_enabled
         self.tts = XiaoxiaoTTS(tts_command)
+        self.keyboard = KeyboardMonitor()
+        self.post_tts_cooldown = post_tts_cooldown
+        self.resume_listen_at = 0.0
         self.session_id = session_id or f"voice-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
 
         self.audio = pyaudio.PyAudio()
@@ -331,7 +438,7 @@ class VoiceListener:
         finally:
             os.unlink(temp_path)
 
-    def ask_openclaw(self, text: str) -> str | None:
+    def build_openclaw_command(self, text: str) -> list[str]:
         cmd = [
             "openclaw",
             "--no-color",
@@ -355,21 +462,44 @@ class VoiceListener:
             if self.target:
                 cmd.extend(["--reply-to", self.target])
 
-        try:
-            env = os.environ.copy()
-            if self.gateway_port:
-                env["OPENCLAW_GATEWAY_PORT"] = str(self.gateway_port)
-            if self.gateway_token:
-                env["OPENCLAW_GATEWAY_TOKEN"] = self.gateway_token
+        return cmd
 
+    def build_openclaw_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        if self.gateway_port:
+            env["OPENCLAW_GATEWAY_PORT"] = str(self.gateway_port)
+        if self.gateway_token:
+            env["OPENCLAW_GATEWAY_TOKEN"] = self.gateway_token
+        return env
+
+    def log_openclaw_status(self, payload: dict):
+        run_id, status, summary = extract_run_status(payload)
+        status_parts = []
+        if run_id:
+            status_parts.append(f"runId={run_id}")
+        if status:
+            status_parts.append(f"status={status}")
+        if summary:
+            status_parts.append(f"summary={summary}")
+        if status_parts:
+            print("OpenClaw status: " + ", ".join(status_parts))
+
+    def ask_openclaw(self, text: str) -> str | None:
+        cmd = self.build_openclaw_command(text)
+
+        try:
+            start_at = time.monotonic()
+            print("Sending to OpenClaw...")
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout + 10,
                 check=False,
-                env=env,
+                env=self.build_openclaw_env(),
             )
+            duration = time.monotonic() - start_at
+            print(f"OpenClaw response received in {duration:.1f}s")
         except subprocess.TimeoutExpired:
             print("OpenClaw timeout")
             return None
@@ -384,7 +514,9 @@ class VoiceListener:
 
         payload = parse_json_output(result.stdout)
         if not payload:
+            print("OpenClaw status: parse_failed (non-JSON response)")
             return None
+        self.log_openclaw_status(payload)
         return extract_reply(payload)
 
     def speak(self, text: str):
@@ -393,12 +525,48 @@ class VoiceListener:
         if not self.tts.is_available():
             print(f"TTS command not available: {self.tts.command_path}")
             return
+
+        tts_text = sanitize_tts_text(text)
+        if not tts_text:
+            print("TTS skipped: no speakable text after sanitizing")
+            return
+
         print("Playing TTS...")
-        if not self.tts.playback(text):
-            print("TTS playback failed")
+        print("Press SPACE to stop TTS")
+        if not self.tts.playback(tts_text, stop_checker=self.keyboard.consume_space_pressed):
+            print("TTS playback stopped or failed")
+
+    def flush_input(self, stream, seconds: float):
+        end_time = time.monotonic() + max(0.0, seconds)
+        while self.running and time.monotonic() < end_time:
+            try:
+                stream.read(CHUNK, exception_on_overflow=False)
+            except Exception:
+                pass
+
+    def process_transcript(self, transcript: str, stream):
+        if transcript and is_meaningful_text(transcript):
+            now = datetime.now().strftime("%H:%M:%S")
+            print(f"[{now}] You: {transcript}")
+            reply = self.ask_openclaw(transcript)
+            if reply:
+                print(f"[{now}] OpenClaw: {reply}")
+                sys.stdout.flush()
+                self.speak(reply)
+                self.resume_listen_at = time.monotonic() + self.post_tts_cooldown
+                self.flush_input(stream, self.post_tts_cooldown)
+            else:
+                print(f"[{now}] OpenClaw returned no parsable reply")
+            return
+
+        if transcript:
+            print(f"Filtered: {transcript}")
+        else:
+            print("No speech detected")
 
     def start(self):
         self.running = True
+        self.keyboard.start()
 
         stream = self.audio.open(
             format=FORMAT,
@@ -420,6 +588,10 @@ class VoiceListener:
                     time.sleep(0.1)
                     continue
 
+                if time.monotonic() < self.resume_listen_at:
+                    self.flush_input(stream, 0.1)
+                    continue
+
                 try:
                     data = stream.read(CHUNK, exception_on_overflow=False)
                 except Exception:
@@ -434,25 +606,13 @@ class VoiceListener:
                     audio_data = data + self.record_until_silence(stream)
                     print("Transcribing...")
                     text = self.transcribe(audio_data)
-
-                    if text and is_meaningful_text(text):
-                        now = datetime.now().strftime("%H:%M:%S")
-                        print(f"[{now}] You: {text}")
-                        reply = self.ask_openclaw(text)
-                        if reply:
-                            print(f"[{now}] OpenClaw: {reply}")
-                            self.speak(reply)
-                        else:
-                            print(f"[{now}] OpenClaw returned no parsable reply")
-                    elif text:
-                        print(f"Filtered: {text}")
-                    else:
-                        print("No speech detected")
+                    self.process_transcript(text, stream)
 
         except KeyboardInterrupt:
             print("\nStopping listener")
         finally:
             self.running = False
+            self.keyboard.stop()
             stream.stop_stream()
             stream.close()
 
@@ -472,6 +632,7 @@ def main():
     parser.add_argument("--gateway-token", help="Override OPENCLAW_GATEWAY_TOKEN")
     parser.add_argument("--tts-command", default=DEFAULT_TTS_COMMAND, help="Local TTS command path")
     parser.add_argument("--no-tts", action="store_true", help="Disable local TTS playback")
+    parser.add_argument("--post-tts-cooldown", type=float, default=POST_TTS_COOLDOWN, help="Seconds to discard mic input after TTS")
     parser.add_argument(
         "--deliver",
         action="store_true",
@@ -501,6 +662,7 @@ def main():
         gateway_token=args.gateway_token,
         tts_enabled=not args.no_tts,
         tts_command=args.tts_command,
+        post_tts_cooldown=args.post_tts_cooldown,
     )
 
     if args.list:
