@@ -25,12 +25,45 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import tty
 import unicodedata
 import uuid
 import wave
 from datetime import datetime
+
+# Sound effect file paths (set to empty string to disable)
+# Priority: env var > common system sounds > None
+def find_default_sound():
+    """Find a suitable system sound file."""
+    common_sounds = [
+        # Freedesktop sounds
+        "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga",
+        "/usr/share/sounds/freedesktop/stereo/message.oga",
+        "/usr/share/sounds/freedesktop/stereo/complete.oga",
+        # Ubuntu/Debian sounds
+        "/usr/share/sounds/gnome/default/alerts/glass.ogg",
+        "/usr/share/sounds/gnome/default/alerts/drip.ogg",
+        "/usr/share/sounds/gnome/default/alerts/click.ogg",
+        "/usr/share/sounds/deepin/stereo/message.ogg",
+        # KDE sounds
+        "/usr/share/sounds/deepin/stereo/system-notification.ogg",
+        # ALSA fallback
+        "/usr/share/sounds/alsa/Noise.wav",
+        # macOS sounds
+        "/System/Library/Sounds/Glass.aiff",
+        "/System/Library/Sounds/Tink.aiff",
+        "/System/Library/Sounds/Pop.aiff",
+    ]
+    for path in common_sounds:
+        if os.path.exists(path):
+            return path
+    return None
+
+_DEFAULT_SOUND = find_default_sound()
+SOUND_START_RECORDING = os.environ.get("VOICE_SOUND_START") or _DEFAULT_SOUND
+SOUND_BEFORE_RESPONSE = os.environ.get("VOICE_SOUND_RESPONSE") or _DEFAULT_SOUND
 
 import pyaudio
 from faster_whisper import WhisperModel
@@ -91,6 +124,63 @@ NOISE_PATTERNS = [
 ]
 
 
+def play_sound_effect(sound_path: str) -> bool:
+    """Play a sound effect using available audio tools."""
+    if not sound_path or not os.path.exists(sound_path):
+        return False
+
+    # Try multiple methods to play sound
+    methods = [
+        # Method 1: paplay (PulseAudio)
+        (lambda p: subprocess.Popen(
+            ["paplay", p],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ), ".wav"),
+        # Method 2: ogg123 (for .oga files)
+        (lambda p: subprocess.Popen(
+            ["ogg123", "-q", p],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ), ".oga"),
+        # Method 3: aplay (ALSA)
+        (lambda p: subprocess.Popen(
+            ["aplay", "-q", p],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ), ".wav"),
+    ]
+
+    ext = os.path.splitext(sound_path)[1].lower()
+
+    for method, supported_ext in methods:
+        if ext != supported_ext:
+            continue
+        try:
+            proc = method(sound_path)
+            threading.Thread(target=lambda: proc.wait(), daemon=True).start()
+            return True
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    return False
+
+
+def has_repeated_chars(text: str, threshold: float = 0.7) -> bool:
+    """Detect if text consists mostly of repeated single character."""
+    if not text or len(text) < 4:
+        return False
+
+    # Count most common character
+    char_counts = {}
+    for char in text:
+        char_counts[char] = char_counts.get(char, 0) + 1
+
+    max_count = max(char_counts.values())
+    return max_count / len(text) >= threshold
+
+
 def is_meaningful_text(text: str) -> bool:
     if not text:
         return False
@@ -100,6 +190,10 @@ def is_meaningful_text(text: str) -> bool:
         return False
 
     if "简体中文" in text:
+        return False
+
+    # Filter repeated characters like "证证证证证证" or "啊啊啊啊啊啊啊啊啊啊啊啊啊"
+    if has_repeated_chars(text):
         return False
 
     text_lower = text.lower()
@@ -135,42 +229,45 @@ def parse_json_output(stdout: str) -> dict | None:
     return None
 
 
-def extract_reply(payload: dict) -> str | None:
-    """Best-effort extraction across likely OpenClaw response shapes."""
-    candidates = [
-        payload.get("reply"),
-        payload.get("response"),
-        payload.get("output"),
-        payload.get("text"),
-    ]
+def extract_replies(payload: dict) -> list[str]:
+    """Extract all replies from OpenClaw response (supports multiple messages)."""
+    replies = []
+    if not isinstance(payload, dict):
+        return replies
 
+    # Direct fields
+    for key in ["reply", "response", "output", "text"]:
+        if key in payload and isinstance(payload[key], str) and payload[key].strip():
+            replies.append(payload[key].strip())
+            break
+
+    # Nested result
     result = payload.get("result")
     if isinstance(result, dict):
-        candidates.extend(
-            [
-                result.get("reply"),
-                result.get("response"),
-                result.get("output"),
-                result.get("text"),
-            ]
-        )
+        for key in ["reply", "response", "output", "text"]:
+            if key in result and isinstance(result[key], str) and result[key].strip():
+                replies.append(result[key].strip())
+                break
 
+        # Multiple payloads
         payloads = result.get("payloads")
         if isinstance(payloads, list):
             for entry in payloads:
                 if isinstance(entry, dict):
-                    candidates.extend(
-                        [
-                            entry.get("text"),
-                            entry.get("message"),
-                            entry.get("content"),
-                        ]
-                    )
+                    for key in ["text", "message", "content"]:
+                        if key in entry and isinstance(entry[key], str) and entry[key].strip():
+                            replies.append(entry[key].strip())
+                            break
 
-    for item in candidates:
-        if isinstance(item, str) and item.strip():
-            return item.strip()
-    return None
+    # Deduplicate while preserving order
+    seen = set()
+    unique_replies = []
+    for r in replies:
+        if r not in seen:
+            seen.add(r)
+            unique_replies.append(r)
+
+    return unique_replies
 
 
 def extract_run_status(payload: dict) -> tuple[str | None, str | None, str | None]:
@@ -210,7 +307,19 @@ def sanitize_tts_text(text: str) -> str:
     return cleaned
 
 
-class XiaoxiaoTTS:
+class TTSProvider:
+    """Base class for TTS providers."""
+
+    def is_available(self) -> bool:
+        raise NotImplementedError
+
+    def playback(self, text: str, stop_checker=None) -> bool:
+        raise NotImplementedError
+
+
+class XiaoxiaoTTS(TTSProvider):
+    """Xiaoxiao TTS using local command."""
+
     def __init__(self, command_path: str = DEFAULT_TTS_COMMAND):
         self.command_path = os.path.expanduser(command_path)
 
@@ -261,6 +370,46 @@ class XiaoxiaoTTS:
                 pass
 
 
+class STTModel:
+    """Base class for Speech-to-Text models."""
+
+    def transcribe(self, audio_data: bytes, sample_rate: int) -> str:
+        raise NotImplementedError
+
+    def close(self):
+        pass
+
+
+class WhisperSTT(STTModel):
+    """Whisper STT model using faster-whisper."""
+
+    def __init__(self, model_size: str = MODEL_SIZE, language: str = "zh"):
+        self.model_size = model_size
+        self.language = language
+        print(f"Loading Whisper model ({model_size})...")
+        self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        print("Model loaded")
+
+    def transcribe(self, audio_data: bytes, sample_rate: int) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as file_obj:
+            temp_path = file_obj.name
+            with wave.open(file_obj, "wb") as wav:
+                wav.setnchannels(CHANNELS)
+                wav.setsampwidth(2)
+                wav.setframerate(sample_rate)
+                wav.writeframes(audio_data)
+
+        try:
+            segments, _ = self.model.transcribe(
+                temp_path,
+                language=self.language,
+                initial_prompt="以下是普通话的句子，使用简体中文。" if self.language == "zh" else None,
+            )
+            return "".join(segment.text for segment in segments).strip()
+        finally:
+            os.unlink(temp_path)
+
+
 class KeyboardMonitor:
     def __init__(self):
         self.enabled = False
@@ -303,7 +452,8 @@ class VoiceListener:
     def __init__(
         self,
         device_index=None,
-        model_size=MODEL_SIZE,
+        stt_model: STTModel | None = None,
+        tts_provider: TTSProvider | None = None,
         session_id=None,
         channel="telegram",
         target=None,
@@ -326,24 +476,30 @@ class VoiceListener:
         self.gateway_port = gateway_port
         self.gateway_token = gateway_token
         self.tts_enabled = tts_enabled
-        self.tts = XiaoxiaoTTS(tts_command)
-        self.keyboard = KeyboardMonitor()
         self.post_tts_cooldown = post_tts_cooldown
         self.resume_listen_at = 0.0
         self.session_id = session_id or f"voice-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
 
-        self.audio = pyaudio.PyAudio()
+        # Initialize TTS provider (once, reusable)
+        self.tts = tts_provider if tts_provider else XiaoxiaoTTS(tts_command)
+
+        # Initialize STT model (once, reusable) - only if not provided and needed
+        self.stt = stt_model
+
+        self.keyboard = KeyboardMonitor()
+
+        # Only initialize audio if STT is needed
+        if self.stt is not None:
+            self.audio = pyaudio.PyAudio()
+        else:
+            self.audio = None
         self.rate = self._get_device_rate()
         print(f"Using sample rate: {self.rate} Hz")
         print(f"OpenClaw session: {self.session_id}")
         if self.tts_enabled and self.tts.is_available():
-            print(f"TTS enabled: {self.tts.command_path}")
+            print(f"TTS enabled: {getattr(self.tts, 'command_path', type(self.tts).__name__)}")
         elif self.tts_enabled:
-            print(f"TTS command not found: {self.tts.command_path}")
-
-        print(f"Loading Whisper model ({model_size})...")
-        self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        print("Model loaded")
+            print(f"TTS not available")
 
     def _get_device_rate(self) -> int:
         if self.device_index is not None:
@@ -389,6 +545,10 @@ class VoiceListener:
         chunks_per_second = self.rate // CHUNK
         max_silent_chunks = int(SILENCE_DURATION * chunks_per_second)
 
+        # Play sound effect when starting to record
+        if SOUND_START_RECORDING:
+            play_sound_effect(SOUND_START_RECORDING)
+
         print("Recording...", end="", flush=True)
 
         while self.running:
@@ -420,23 +580,7 @@ class VoiceListener:
         return b"".join(frames)
 
     def transcribe(self, audio_data: bytes) -> str:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as file_obj:
-            temp_path = file_obj.name
-            with wave.open(file_obj, "wb") as wav:
-                wav.setnchannels(CHANNELS)
-                wav.setsampwidth(2)
-                wav.setframerate(self.rate)
-                wav.writeframes(audio_data)
-
-        try:
-            segments, _ = self.model.transcribe(
-                temp_path,
-                language="zh",
-                initial_prompt="以下是普通话的句子，使用简体中文。",
-            )
-            return "".join(segment.text for segment in segments).strip()
-        finally:
-            os.unlink(temp_path)
+        return self.stt.transcribe(audio_data, self.rate)
 
     def build_openclaw_command(self, text: str) -> list[str]:
         cmd = [
@@ -484,40 +628,74 @@ class VoiceListener:
         if status_parts:
             print("OpenClaw status: " + ", ".join(status_parts))
 
-    def ask_openclaw(self, text: str) -> str | None:
+    def ask_openclaw(self, text: str) -> list[str]:
+        """Send text to OpenClaw and return list of replies (supports multiple messages)."""
         cmd = self.build_openclaw_command(text)
 
         try:
+            import shutil
+
             start_at = time.monotonic()
-            print("Sending to OpenClaw...")
-            result = subprocess.run(
+
+            # Check if openclaw exists
+            openclaw_path = shutil.which("openclaw")
+            if not openclaw_path:
+                print("openclaw command not found in PATH")
+                return []
+
+            print("Sending to OpenClaw...", end=" ", flush=True)
+
+            # Start the process
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.timeout + 10,
-                check=False,
                 env=self.build_openclaw_env(),
             )
+
+            # Sending done, now waiting for reply
+            print("Waiting for reply...")
+
+            # Wait for completion with timeout
+            try:
+                stdout, stderr = process.communicate(timeout=self.timeout + 10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                print("OpenClaw timeout")
+                return []
+
             duration = time.monotonic() - start_at
             print(f"OpenClaw response received in {duration:.1f}s")
-        except subprocess.TimeoutExpired:
-            print("OpenClaw timeout")
-            return None
+
+            # Create a result object similar to subprocess.run
+            class Result:
+                pass
+
+            result = Result()
+            result.returncode = process.returncode
+            result.stdout = stdout
+            result.stderr = stderr
         except FileNotFoundError:
             print("openclaw command not found in PATH")
-            return None
+            return []
 
         if result.returncode != 0:
             err = (result.stderr or result.stdout).strip()
             print(f"OpenClaw error: {err}")
-            return None
+            return []
 
         payload = parse_json_output(result.stdout)
         if not payload:
             print("OpenClaw status: parse_failed (non-JSON response)")
-            return None
+            return []
         self.log_openclaw_status(payload)
-        return extract_reply(payload)
+
+        replies = extract_replies(payload)
+        if not replies:
+            print("OpenClaw status: no_reply_extracted")
+        return replies
 
     def speak(self, text: str):
         if not self.tts_enabled:
@@ -525,6 +703,10 @@ class VoiceListener:
         if not self.tts.is_available():
             print(f"TTS command not available: {self.tts.command_path}")
             return
+
+        # Play sound effect before OpenClaw response
+        if SOUND_BEFORE_RESPONSE:
+            play_sound_effect(SOUND_BEFORE_RESPONSE)
 
         tts_text = sanitize_tts_text(text)
         if not tts_text:
@@ -548,11 +730,15 @@ class VoiceListener:
         if transcript and is_meaningful_text(transcript):
             now = datetime.now().strftime("%H:%M:%S")
             print(f"[{now}] You: {transcript}")
-            reply = self.ask_openclaw(transcript)
-            if reply:
-                print(f"[{now}] OpenClaw: {reply}")
-                sys.stdout.flush()
-                self.speak(reply)
+            replies = self.ask_openclaw(transcript)
+            if replies:
+                for i, reply in enumerate(replies):
+                    print(f"[{now}] OpenClaw ({i+1}/{len(replies)}): {reply}")
+                    sys.stdout.flush()
+                    self.speak(reply)
+                    # Add small delay between multiple responses
+                    if i < len(replies) - 1:
+                        time.sleep(0.3)
                 self.resume_listen_at = time.monotonic() + self.post_tts_cooldown
                 self.flush_input(stream, self.post_tts_cooldown)
             else:
@@ -617,14 +803,96 @@ class VoiceListener:
             stream.close()
 
     def __del__(self):
-        self.audio.terminate()
+        if hasattr(self, "stt") and self.stt:
+            self.stt.close()
+        if hasattr(self, "audio") and self.audio:
+            self.audio.terminate()
+
+
+def run_text_mode(args):
+    """Run in text input mode - type messages instead of voice."""
+    print("\nText mode - Type your message and press Enter")
+    print("=" * 50)
+    print("Commands:")
+    print("  /quit or /q  - Exit")
+    print("  /clear or /c - Clear screen")
+    print("=" * 50)
+
+    # Create TTS provider if enabled
+    tts_provider = XiaoxiaoTTS(args.tts_command) if not args.no_tts else None
+
+    # Create a simple text-based listener
+    listener = VoiceListener(
+        device_index=None,
+        stt_model=None,  # No STT needed for text mode
+        tts_provider=tts_provider,
+        session_id=args.session_id,
+        channel=args.channel,
+        target=args.target,
+        deliver=args.deliver,
+        agent_id=args.agent,
+        timeout=args.timeout,
+        gateway_port=args.gateway_port,
+        gateway_token=args.gateway_token,
+        tts_enabled=not args.no_tts,
+        post_tts_cooldown=0,  # No cooldown needed for text
+    )
+
+    while True:
+        try:
+            user_input = input("\nYou: ").strip()
+
+            if not user_input:
+                continue
+
+            if user_input.lower() in ("/quit", "/q"):
+                print("Goodbye!")
+                break
+
+            if user_input.lower() in ("/clear", "/c"):
+                os.system("clear" if os.name != "nt" else "cls")
+                continue
+
+            now = datetime.now().strftime("%H:%M:%S")
+            replies = listener.ask_openclaw(user_input)
+
+            if replies:
+                for i, reply in enumerate(replies):
+                    print(f"[{now}] OpenClaw ({i+1}/{len(replies)}): {reply}")
+                    if listener.tts_enabled and tts_provider and tts_provider.is_available():
+                        listener.speak(reply)
+                    # Small delay between multiple responses
+                    if i < len(replies) - 1:
+                        time.sleep(0.3)
+            else:
+                print(f"[{now}] OpenClaw returned no parsable reply")
+
+        except KeyboardInterrupt:
+            print("\nGoodbye!")
+            break
+        except EOFError:
+            print("\nGoodbye!")
+            break
+
+
+def create_stt_model(model_name: str) -> STTModel:
+    """Factory function to create STT model by name."""
+    model_lower = model_name.lower()
+
+    # Whisper models
+    if model_lower.startswith("whisper-") or model_lower in ("tiny", "base", "small", "medium", "large", "large-v1", "large-v2", "large-v3"):
+        whisper_size = model_lower.replace("whisper-", "") if model_lower.startswith("whisper-") else model_lower
+        return WhisperSTT(model_size=whisper_size)
+
+    # Default to whisper base
+    return WhisperSTT(model_size=MODEL_SIZE)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Voice listener for OpenClaw Gateway")
     parser.add_argument("--list", action="store_true", help="List audio devices")
     parser.add_argument("--device", type=int, help="Audio device index")
-    parser.add_argument("--model", default=MODEL_SIZE, help="Whisper model size")
+    parser.add_argument("--model", default=f"whisper-{MODEL_SIZE}", help="STT model (whisper-tiny/base/small/medium/large)")
     parser.add_argument("--session-id", help="OpenClaw session id (fixed)")
     parser.add_argument("--agent", help="OpenClaw agent id")
     parser.add_argument("--timeout", type=int, default=120, help="OpenClaw timeout seconds")
@@ -647,11 +915,28 @@ def main():
         "--target",
         help="reply target when --deliver is enabled (chat id/user)",
     )
+    parser.add_argument(
+        "-t", "--text",
+        action="store_true",
+        help="Text input mode (type instead of voice)",
+    )
     args = parser.parse_args()
+
+    # Text input mode
+    if args.text:
+        run_text_mode(args)
+        return
+
+    # Create STT model (once, reusable)
+    stt_model = create_stt_model(args.model)
+
+    # Create TTS provider (once, reusable)
+    tts_provider = XiaoxiaoTTS(args.tts_command) if not args.no_tts else None
 
     listener = VoiceListener(
         device_index=args.device,
-        model_size=args.model,
+        stt_model=stt_model,
+        tts_provider=tts_provider,
         session_id=args.session_id,
         channel=args.channel,
         target=args.target,
@@ -661,7 +946,6 @@ def main():
         gateway_port=args.gateway_port,
         gateway_token=args.gateway_token,
         tts_enabled=not args.no_tts,
-        tts_command=args.tts_command,
         post_tts_cooldown=args.post_tts_cooldown,
     )
 
