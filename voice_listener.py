@@ -853,6 +853,10 @@ def run_text_mode(args):
                 os.system("clear" if os.name != "nt" else "cls")
                 continue
 
+            if user_input.lower() == "stt":
+                print("Switching to voice mode...")
+                return "SWITCH_TO_VOICE"
+
             now = datetime.now().strftime("%H:%M:%S")
             replies = listener.ask_openclaw(user_input)
 
@@ -924,8 +928,12 @@ def main():
 
     # Text input mode
     if args.text:
-        run_text_mode(args)
-        return
+        result = run_text_mode(args)
+        if result == "SWITCH_TO_VOICE":
+            # Clear the --text flag and run voice mode
+            args.text = False
+        else:
+            return
 
     # Create STT model (once, reusable)
     stt_model = create_stt_model(args.model)
